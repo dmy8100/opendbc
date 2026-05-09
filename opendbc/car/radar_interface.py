@@ -21,7 +21,7 @@ from opendbc.can import CANParser
 from opendbc.car import structs
 
 # car head to radar
-DREL_OFFSET = -1.52
+DREL_OFFSET = -0.1
 
 # lat distance, typically max lane width is 3.7m
 MAX_LAT_DIST = 6.
