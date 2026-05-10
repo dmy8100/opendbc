@@ -432,6 +432,10 @@ struct CarControl {
       prompt @6;
       promptRepeat @7;
       promptDistracted @8;
+
+      preLaneChangeLeft @9;
+      preLaneChangeRight @10;
+      laneChange @11;
     }
   }
 
