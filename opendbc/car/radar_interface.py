@@ -17,40 +17,82 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 """
 
 from opendbc.car.interfaces import RadarInterfaceBase
-from opendbc.can import CANParser
-from opendbc.car import structs
+from opendbc.can.parser import CANParser
+from opendbc.car.structs import RadarData
+from typing import List, Tuple
 
 # car head to radar
 DREL_OFFSET = -0.1
 
+# max object amount will process
+MAX_OBJECTS = 100
+
 # lat distance, typically max lane width is 3.7m
-MAX_LAT_DIST = 6.
+MAX_LAT_DIST = 3.6
 
 # objects to ignore thats really close to the vehicle (after DREL_OFFSET applied)
-MIN_DIST = 5.
+MIN_DIST = 0.5
+
+# when a object has really large negative v_rel means its stationary / standstill
+# so with the values below (v_rel = -10, lat_dist = 2.), we are trying to ignore:
+# when the ego vehicle is driving above 36 km/h (22.37 mph), we will ignore objects that lateral distance is above 2m on left or right.
+STATIONARY_OBJ_VREL = -10.
+STATIONARY_OBJ_LAT_DIST = 2.
+
+# when we detect an object that's really closed to the ego vehicle
+# we ignore the objects that's away from left or right
+CLOSED_OBJ_DREL = 10
+CLOSED_OBJ_YREL = 2.
+
+# ignore objects that has small radar cross sections (-64 ~ 63.5)
+MIN_RCS = -5.
 
 # ignore oncoming objects
 IGNORE_OBJ_STATE = 2
 
 # ignore objects that we haven't seen for 5 secs
-NOT_SEEN_INIT = 33
+NOT_SEEN_INIT = 33*5
 
-
-def _create_radar_parser() -> CANParser:
-  return CANParser('u_radar', [("Status", float('nan')), ("ObjectData", float('nan'))], 1)
-
+def _create_radar_parser():
+  messages = [("Status", float('nan')), ("ObjectData", float('nan'))]
+  messages += [(f"ObjectData_{i}", float('nan')) for i in range(MAX_OBJECTS)]
+  return CANParser('u_radar', messages, 1)
 
 class RadarInterface(RadarInterfaceBase):
-  def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP):
+  def __init__(self, CP, CP_SP=None):
     super().__init__(CP, CP_SP)
 
     self.updated_messages = set()
+
     self.rcp = _create_radar_parser()
 
     self._pts_cache = dict()
     self._pts_not_seen = {key: 0 for key in range(255)}
     self._should_clear_cache = False
 
+  def _create_parsable_object_can_strings(self, can_strings: List[Tuple]) -> Tuple[List[Tuple], int]:
+    """Optimized object string parsing with minimal allocations."""
+    if not can_strings or not isinstance(can_strings[0], tuple) or len(can_strings[0]) < 2:
+      return [], 0
+
+    # Pre-allocate list with known maximum size
+    new_list = []
+    new_list_append = new_list.append  # Local reference for faster access
+
+    records = can_strings[0][1]
+    id_num = 1
+
+    for record in records:
+      if id_num > MAX_OBJECTS:
+        break
+
+      if record[0] == 0x60B:
+        new_list_append((id_num + 383, record[1], record[2]))
+        id_num += 1
+
+    return [(can_strings[0][0], new_list)], len(new_list)
+
+  # called by card.py, 100hz
   def update(self, can_strings):
     vls = self.rcp.update(can_strings)
     self.updated_messages.update(vls)
@@ -59,62 +101,61 @@ class RadarInterface(RadarInterfaceBase):
       self._should_clear_cache = True
 
     if 1547 in self.updated_messages:
-      all_objects = zip(
-        self.rcp.vl_all['ObjectData']['ID'],
-        self.rcp.vl_all['ObjectData']['DistLong'],
-        self.rcp.vl_all['ObjectData']['DistLat'],
-        self.rcp.vl_all['ObjectData']['VRelLong'],
-        self.rcp.vl_all['ObjectData']['VRelLat'],
-        self.rcp.vl_all['ObjectData']['DynProp'],
-        self.rcp.vl_all['ObjectData']['Class'],
-        self.rcp.vl_all['ObjectData']['RCS'],
-      )
+      parsable_can_string, size = self._create_parsable_object_can_strings(can_strings)
+      self.rcp.update(parsable_can_string)
 
+      # clean cache when we see a 0x60a then a 0x60b
       if self._should_clear_cache:
         self._pts_cache.clear()
         self._should_clear_cache = False
 
-      for track_id, dist_long, dist_lat, vrel_long, vrel_lat, dyn_prop, obj_class, rcs in all_objects:
-        d_rel = dist_long + DREL_OFFSET
-        y_rel = -dist_lat
+      for i in range(size):
+        cpt = self.rcp.vl[f'ObjectData_{i}']
+        track_id = int(cpt['ID'])
 
-        should_ignore = False
-
-        # ignore point (obj_class = 0)
-        if not should_ignore and int(obj_class) == 0:
-          should_ignore = True
-
-        # ignore closed objects, rely on vision
-        if not should_ignore and d_rel < MIN_DIST:
-          should_ignore = True
+        d_rel = float(cpt['DistLong']) + DREL_OFFSET
+        y_rel = -float(cpt['DistLat'])
+        obj_class = int(cpt['Class'])
 
         # ignore oncoming objects
-        if not should_ignore and int(dyn_prop) == IGNORE_OBJ_STATE:
-          should_ignore = True
+        if int(cpt['DynProp']) == IGNORE_OBJ_STATE:
+          continue
 
-        # ignore objects on left/right side
-        if not should_ignore and abs(y_rel) > MAX_LAT_DIST:
-          should_ignore = True
+        # only apply filters below when object is a point (0) not a vehicle (1)
+        if obj_class == 0:
+          #continue
+          # ignore really closed objects
+          if d_rel < MIN_DIST:
+            continue
 
-        if should_ignore:
-          self._pts_not_seen[track_id] = -1
-        else:
-          self._pts_not_seen[track_id] = NOT_SEEN_INIT
+          # ignore objects with really small radar cross sections
+          if float(cpt['RCS']) < MIN_RCS:
+            continue
 
-          if track_id not in self._pts_cache:
-            self._pts_cache[track_id] = structs.RadarData.RadarPoint()
-            self._pts_cache[track_id].trackId = track_id
+          # ignore far left/right objects
+          if abs(y_rel) > MAX_LAT_DIST:
+            continue
 
-          self._pts_cache[track_id].dRel = d_rel
-          self._pts_cache[track_id].yRel = y_rel
-          self._pts_cache[track_id].vRel = float(vrel_long)
-          self._pts_cache[track_id].yvRel = float('nan')
-          self._pts_cache[track_id].aRel = float('nan')
-          self._pts_cache[track_id].measured = True
+          # ignore closed left/right objects when closed
+          if d_rel < CLOSED_OBJ_DREL and abs(y_rel) > CLOSED_OBJ_YREL:
+            continue
+
+        # add to cache
+        if track_id not in self._pts_cache:
+          self._pts_cache[track_id] = RadarData.RadarPoint()
+          self._pts_cache[track_id].trackId = track_id
+
+        self._pts_not_seen[track_id] = NOT_SEEN_INIT
+        self._pts_cache[track_id].yvRel = float(cpt['VRelLat'])
+        self._pts_cache[track_id].dRel = d_rel
+        self._pts_cache[track_id].yRel = y_rel
+        self._pts_cache[track_id].vRel = float(cpt['VRelLong'])
+        self._pts_cache[track_id].aRel = float('nan')
+        self._pts_cache[track_id].measured = True
 
     self.updated_messages.clear()
 
-    if self.frame % 3 == 0:
+    if self.frame % 2 == 0:
       keys_to_remove = [key for key in self.pts if key not in self._pts_cache]
       for key in keys_to_remove:
         self._pts_not_seen[key] -= 1
@@ -123,7 +164,7 @@ class RadarInterface(RadarInterfaceBase):
 
       self.pts.update(self._pts_cache)
 
-      ret = structs.RadarData()
+      ret = RadarData()
       if not self.rcp.can_valid:
         ret.errors.canError = True
 
